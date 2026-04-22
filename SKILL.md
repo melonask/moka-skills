@@ -72,16 +72,16 @@ fn main() {
     cache.insert("key1".to_string(), "value1".to_string());
     cache.insert("key2".to_string(), "value2".to_string());
 
-    // Retrieve entries
-    if let Some(value) = cache.get(&"key1".to_string()) {
+    // Retrieve entries (borrowed-key lookup)
+    if let Some(value) = cache.get("key1") {
         println!("Found: {}", value);
     }
 
     // Check existence (does NOT update access recency)
-    assert!(cache.contains_key(&"key1".to_string()));
+    assert!(cache.contains_key("key1"));
 
     // Remove a single entry
-    cache.invalidate(&"key1".to_string());
+    cache.invalidate("key1");
 
     // Remove all entries (lazy invalidation — marks a timestamp, entries are
     // actually evicted on subsequent accesses)
@@ -107,12 +107,12 @@ async fn main() {
 
     cache.insert("key1".to_string(), "value1".to_string()).await;
 
-    if let Some(value) = cache.get(&"key1".to_string()).await {
+    if let Some(value) = cache.get("key1").await {
         println!("Found: {}", value);
     }
 
-    cache.invalidate(&"key1".to_string()).await;
-    cache.invalidate_all().await;
+    cache.invalidate("key1").await;
+    cache.invalidate_all();
 }
 ```
 
@@ -269,14 +269,14 @@ fn main() {
     // entry.into_value() == 10 (the old value, NOT 20)
 
     // Borrowed key version (avoids cloning the key)
-    let entry = cache.entry_by_ref(&"key2").or_insert(30);
+    let entry = cache.entry_by_ref("key2").or_insert(30);
     // entry.is_fresh() == true
 
     // Lazy initialization
-    let entry = cache.entry_by_ref(&"key3").or_insert_with(|| expensive_compute());
+    let entry = cache.entry_by_ref("key3").or_insert_with(|| expensive_compute());
 
     // Use default value
-    let entry = cache.entry_by_ref(&"key4").or_default();
+    let entry = cache.entry_by_ref("key4").or_default();
 }
 ```
 
@@ -397,6 +397,12 @@ use moka::sync::Cache;
 use moka::Expiry;
 use std::time::{Duration, Instant};
 
+#[derive(Clone)]
+struct ApiKeyData {
+    ttl: Duration,
+    // ... other fields
+}
+
 struct ApiKeyExpiry;
 
 impl Expiry<String, ApiKeyData> for ApiKeyExpiry {
@@ -415,9 +421,9 @@ impl Expiry<String, ApiKeyData> for ApiKeyExpiry {
         &self,
         _key: &String,
         _value: &ApiKeyData,
-        last_modified_at: Instant,
-        last_accessed_at: Instant,
-        current_time: Instant,
+        _read_at: Instant,
+        _duration_until_expiry: Option<Duration>,
+        _last_modified_at: Instant,
     ) -> Option<Duration> {
         // Don't extend expiration on read — fixed TTL
         None
@@ -428,16 +434,11 @@ impl Expiry<String, ApiKeyData> for ApiKeyExpiry {
         &self,
         _key: &String,
         value: &ApiKeyData,
-        _last_modified_at: Instant,
-        _current_time: Instant,
+        _updated_at: Instant,
+        _duration_until_expiry: Option<Duration>,
     ) -> Option<Duration> {
         Some(value.ttl)
     }
-}
-
-struct ApiKeyData {
-    ttl: Duration,
-    // ... other fields
 }
 
 let cache = Cache::builder()
@@ -477,7 +478,7 @@ let cache = Cache::builder()
                 println!("Evicted by size for key {}: {}", key, value);
             }
             _ => {
-                println!("Removed key {}: {:?} — {}", key, value, cause);
+                println!("Removed key {}: {:?} — {:?}", key, value, cause);
             }
         }
     })
@@ -490,12 +491,18 @@ For async caches, use `notification::ListenerFuture` and the `FutureExt` trait:
 
 ```rust
 use moka::future::{Cache, FutureExt};
+use moka::notification::RemovalCause;
+use std::sync::Arc;
 use std::time::Duration;
 
-let cache = Cache::builder()
+async fn async_cleanup(_key: Arc<String>, _value: String, _cause: RemovalCause) {
+    // async cleanup logic
+}
+
+let cache: Cache<String, String> = Cache::builder()
     .max_capacity(100)
     .time_to_live(Duration::from_secs(10))
-    .eviction_listener(|key, value: String, cause| {
+    .async_eviction_listener(|key, value: String, cause| {
         // Box the async block for the eviction listener
         async move {
             async_cleanup(key, value, cause).await;
@@ -510,8 +517,8 @@ let cache = Cache::builder()
 ### Single Entry Invalidation
 
 ```rust
-cache.invalidate(&key);    // Remove by key reference
-cache.remove(&key);        // Remove by key reference, returns Option<V>
+cache.invalidate(&key);    // Remove by key reference (borrowed)
+cache.remove(&key);         // Remove by key reference, returns Option<V>
 ```
 
 ### Bulk Invalidation
@@ -535,19 +542,16 @@ let cache = Cache::builder()
     .build();
 
 // Store user session data
-cache.insert("user:1".to_string(), SessionData { is_active: false, .. });
-cache.insert("user:2".to_string(), SessionData { is_active: true, .. });
+cache.insert("user:1".to_string(), SessionData { is_active: false });
+cache.insert("user:2".to_string(), SessionData { is_active: true });
 
 // Remove all inactive sessions
-let predicate_id = cache.invalidate_entries_if(|k, v: &SessionData| {
+let _predicate_id = cache.invalidate_entries_if(|_k, v: &SessionData| {
     !v.is_active
 }).expect("Invalidation predicate should not conflict");
-
-// Clean up the predicate when no longer needed (prevents memory leak)
-cache.remove_predicates(&[predicate_id]);
 ```
 
-Each call to `invalidate_entries_if` returns a `PredicateId`. You must eventually call `remove_predicates` with these IDs to free the stored closures, otherwise they will leak memory. This is a deliberate design choice — Moka cannot know when you are done with a predicate, so it is your responsibility to clean up.
+Each call to `invalidate_entries_if` returns a `PredicateId`. Predicates are cleaned up automatically by the housekeeper over time; there is no public `remove_predicates` method. You can let them expire naturally, or force cleanup by calling `run_pending_tasks()`.
 
 ## Iteration
 
@@ -587,7 +591,7 @@ let cache = SegmentedCache::builder(16)
 
 // Same API as Cache
 cache.insert("key".to_string(), "value".to_string());
-let value = cache.get(&"key".to_string());
+let value = cache.get("key");
 ```
 
 The number of segments should be a power of two. A good default is the number of CPU cores, or a nearby power of two. Each segment operates independently for policy operations (eviction, expiration), so the effective concurrency scales with the number of segments.
@@ -599,7 +603,7 @@ Moka uses `std::collections::hash_map::RandomState` by default. You can specify 
 ```rust
 use moka::sync::Cache;
 
-let cache = Cache::builder()
+let cache: Cache<String, String, ahash::RandomState> = Cache::builder()
     .max_capacity(10_000)
     .build_with_hasher(ahash::RandomState::default());
 
@@ -718,9 +722,9 @@ impl Expiry<String, String> for RefreshExpiry {
         &self,
         _key: &String,
         _value: &String,
+        _read_at: Instant,
+        _duration_until_expiry: Option<Duration>,
         _last_modified_at: Instant,
-        _last_accessed_at: Instant,
-        _current_time: Instant,
     ) -> Option<Duration> {
         Some(Duration::from_secs(60)) // Reset TTL on read
     }
@@ -741,7 +745,7 @@ use moka::sync::Cache;
 use moka::policy::EvictionPolicy;
 use std::time::Duration;
 
-let cache = Cache::builder()
+let cache: Cache<String, String, ahash::RandomState> = Cache::builder()
     // Identity
     .name("my-cache")                              // Optional name for logging/debugging
 
@@ -753,17 +757,17 @@ let cache = Cache::builder()
     .eviction_policy(EvictionPolicy::tiny_lfu())    // or EvictionPolicy::lru() (default: tiny_lfu)
 
     // Size-aware eviction
-    .weigher(|_key: &K, value: &V| -> u32 {        // Weight function; enables size-bounded cache
-        value.size() as u32
+    .weigher(|_key: &String, value: &Vec<u8>| -> u32 {
+        value.len() as u32
     })
 
     // Expiration
     .time_to_live(Duration::from_secs(30 * 60))    // Max age from create/update
     .time_to_idle(Duration::from_secs(5 * 60))     // Max age from last access
-    .expire_after(MyExpiry)                         // Per-entry custom expiry (overrides TTL/TTI)
+    // .expire_after(MyExpiry)                      // Per-entry custom expiry (overrides TTL/TTI)
 
     // Callbacks
-    .eviction_listener(|key, value, cause| {        // Called on entry removal
+    .eviction_listener(|_key, _value, _cause| {     // Called on entry removal
         // cleanup logic
     })
 
@@ -791,7 +795,7 @@ let cache: Cache<String, Vec<u8>> = Cache::new(100);
 cache.insert("key1".to_string(), vec![1, 2, 3]);
 
 // Look up with borrowed types (no allocation)
-if let Some(value) = cache.get(&"key1") {  // &str -> String via Equivalent
+if let Some(value) = cache.get("key1") {  // &str -> String via Equivalent
     println!("{:?}", value);
 }
 ```
@@ -836,9 +840,9 @@ let cache = Cache::builder()
     .build();
 
 let policy = cache.policy();
-assert_eq!(policy.max_capacity(), 10_000);
+assert_eq!(policy.max_capacity(), Some(10_000));
 assert_eq!(policy.time_to_live(), Some(Duration::from_secs(60)));
-assert_eq!(policy.name(), Some("my-cache"));
+assert_eq!(cache.name(), Some("my-cache"));
 ```
 
 ## Common Pitfalls
@@ -849,7 +853,7 @@ assert_eq!(policy.name(), Some("my-cache"));
 
 3. **Panicking in eviction listeners** — A panicking listener is permanently disabled with no recovery. Always wrap listener logic in `std::panic::catch_unwind` if there is any risk, or enable the `logging` feature to at least get diagnostics.
 
-4. **Not cleaning up predicates** — Each `invalidate_entries_if` call returns a `PredicateId`. You must call `remove_predicates` with these IDs when done, or the closures (and their captured environment) will leak.
+4. **Not accounting for predicate overhead** — Each `invalidate_entries_if` call registers a predicate that the cache evaluates lazily during maintenance. While the housekeeper cleans them up automatically, excessive use without forced maintenance can accumulate predicates. Call `run_pending_tasks()` periodically if you use many predicates.
 
 5. **Expecting immediate invalidation from `invalidate_all`** — `invalidate_all` is lazy. It sets a timestamp, and entries are actually invalidated on subsequent access. Call `run_pending_tasks()` after `invalidate_all()` if you need immediate cleanup.
 

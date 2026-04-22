@@ -1,4 +1,4 @@
-# moka — Rust Concurrent Cache Skill
+# moka-skills
 
 A comprehensive AI skill for building high-performance caching solutions using the [Moka](https://github.com/moka-rs/moka) Rust library. Moka is a fast, concurrent, in-memory cache library inspired by Java's Caffeine, providing near-optimal hit ratios through the TinyLFU eviction policy.
 
@@ -7,6 +7,12 @@ A comprehensive AI skill for building high-performance caching solutions using t
 This skill enables an LLM to accurately use and develop solutions based on the Moka caching library. It covers the full API surface of Moka v0.12, including synchronous and asynchronous cache types, eviction policies, expiration strategies, and advanced features — all with concrete Rust code examples.
 
 The skill is structured as a single `SKILL.md` file that serves as a complete reference and coding guide. It follows progressive disclosure principles: the metadata (name + description) is always in context for triggering, and the full instructions load when the skill is invoked.
+
+## Installation
+
+```bash
+npx skills add melonask/moka-skills
+```
 
 ## What This Skill Covers
 
@@ -38,15 +44,7 @@ The skill is structured as a single `SKILL.md` file that serves as a complete re
 - **Custom hashers** — Support for `ahash`, `dashmap`, or any `BuildHasher`
 - **Housekeeper model** — No background threads; maintenance runs on caller threads
 
-### Developer Guidance
-
-- Cargo feature flag setup (`sync`, `future`, `logging`, `unstable-debug-counters`)
-- CacheBuilder configuration reference (all options in one code block)
-- Common patterns with production-ready code examples
-- Seven documented pitfalls with explanations and mitigations
-- MSRV and edition requirements
-
-## Skill File Structure
+## File Structure
 
 ```
 moka/
@@ -54,18 +52,6 @@ moka/
     ├── YAML frontmatter (name, description — triggering metadata)
     └── Markdown body (instructions, API reference, code examples)
 ```
-
-## Triggering
-
-The skill triggers automatically when the user asks about:
-
-- In-memory caching in Rust
-- Concurrent or thread-safe caches
-- TTL, TTI, or expiration in caching
-- Cache eviction policies (TinyLFU, LRU)
-- Async caches with tokio or async-std
-- The `moka` crate by name
-- Any request to speed up a Rust application with caching
 
 ## Quick Start Example
 
@@ -90,6 +76,18 @@ fn main() {
 }
 ```
 
+## Trigger Phrases
+
+The skill triggers automatically when the user asks about:
+
+- In-memory caching in Rust
+- Concurrent or thread-safe caches
+- TTL, TTI, or expiration in caching
+- Cache eviction policies (TinyLFU, LRU)
+- Async caches with tokio or async-std
+- The `moka` crate by name
+- Any request to speed up a Rust application with caching
+
 ## Requirements
 
 - **Moka crate**: v0.12.x
@@ -99,4 +97,4 @@ fn main() {
 
 ## License
 
-This skill document is provided for educational and development purposes. The Moka library itself is licensed under MIT OR Apache-2.0.
+This skill document is provided for educational and development purposes. The Moka library is licensed under MIT OR Apache-2.0.
