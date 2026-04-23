@@ -195,9 +195,9 @@ async fn main() -> Result<(), Arc<std::io::Error>> {
 }
 ```
 
-### 5. Conditional Initialization with `get_with_if`
+### 5. Conditional Initialization with `get_with_if` (Deprecated — prefer `entry().or_insert_with_if()`)
 
-Use `get_with_if` when you want to re-initialize an existing entry only if a condition is met. This is useful for implementing refresh-before-expiry patterns.
+Use `entry().or_insert_with_if()` when you want to re-initialize an existing entry only if a condition is met. This is useful for implementing refresh-before-expiry patterns.
 
 ```rust
 use moka::sync::Cache;
@@ -207,20 +207,16 @@ fn main() {
     cache.insert("counter".to_string(), 0);
 
     // Only re-initialize if the current value is 0
-    let value = cache.get_with_if(
-        "counter".to_string(),
-        || 42,
-        |current_value| *current_value == 0,  // replace_if predicate
-    );
-    assert_eq!(value, 42);
+    let entry = cache
+        .entry("counter".to_string())
+        .or_insert_with_if(|| 42, |current_value| *current_value == 0);
+    assert_eq!(*entry.value(), 42);
 
     // Now the value is 42, so the condition is false — returns existing value
-    let value = cache.get_with_if(
-        "counter".to_string(),
-        || 99,
-        |current_value| *current_value == 0,
-    );
-    assert_eq!(value, 42);
+    let entry = cache
+        .entry("counter".to_string())
+        .or_insert_with_if(|| 99, |current_value| *current_value == 0);
+    assert_eq!(*entry.value(), 42);
 }
 ```
 
@@ -661,7 +657,9 @@ fn main() {
             let cache = cache.clone();
             thread::spawn(move || {
                 let key = format!("log:{}", i);
-                cache.get_with(key.clone(), || Vec::new).push(format!("entry from thread {}", i));
+                let mut entries = cache.get_with(key.clone(), Vec::new);
+                entries.push(format!("entry from thread {}", i));
+                cache.insert(key, entries); // re-insert to persist
             })
         })
         .collect();
@@ -694,6 +692,7 @@ fn main() -> Result<(), Arc<std::io::Error>> {
     })?;
 
     entries.push("appended".to_string());
+    cache.insert("log:1".to_string(), entries); // re-insert to persist
     Ok(())
 }
 ```

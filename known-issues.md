@@ -1,16 +1,16 @@
 # Known Issues in Moka Skill (as of April 2026, moka 0.12.15)
 
-This document catalogues all errors found when compiling code copied directly from `SKILL.md` against the latest `moka` crate (v0.12.15). Each issue includes:
+This document catalogues all errors found when compiling and running code copied directly from `SKILL.md` against the latest `moka` crate (v0.12.15). Each issue includes:
 
 1. The original (broken) snippet from the skill.
-2. The compilation error it produces.
+2. The compilation or runtime error it produces.
 3. The corrected, verifiable snippet.
 
 ---
 
 ## Issue 1: Wrong `Expiry` trait method signatures
 
-**Location:** SKILL.md, "Per-Entry Custom Expiration via the `Expiry` Trait" section.
+**Location:** SKILL.md, "Per-Entry Custom Expiration via the `Expiry` Trait" and "Refresh-After-Expiry via Custom Expiry" sections.
 
 **Root Cause:** The skill documents outdated `expire_after_read` and `expire_after_update` signatures that were changed in a recent release of moka. The current signatures include `duration_until_expiry: Option<Duration>` (the remaining TTL/TTI at the time of the call) rather than simple time instants.
 
@@ -111,96 +111,106 @@ impl Expiry<String, ApiKeyData> for ApiKeyExpiry {
 
 ---
 
-## Issue 2: `cache.get(&"key1")` fails for `String` keys
+## Issue 2: `get_with_if` is deprecated
 
-**Location:** SKILL.md, "Basic Cache Operations (Sync)", "Key and Value Types", and multiple other sections.
+**Location:** SKILL.md, "Conditional Initialization with `get_with_if`" section.
 
-**Root Cause:** For borrowed-key lookups, moka uses the `Equivalent<K>` trait which is implemented as `str: Equivalent<String>` (via `String: Borrow<str>`). Passing `&"key1"` gives type `&&str`, but `&str` does **not** implement `Equivalent<String>`. You must pass `"key1"` (type `&str`) directly.
+**Root Cause:** `Cache::get_with_if` was deprecated in moka 0.12.15 and replaced with `entry().or_insert_with_if()`. The old method still compiles but emits a deprecation warning.
 
 ### Broken code (from skill)
 
 ```rust
-if let Some(value) = cache.get(&"key1".to_string()) {
-    println!("Found: {}", value);
-}
-assert!(cache.contains_key(&"key1".to_string()));
-cache.invalidate(&"key1".to_string());
+let value = cache.get_with_if(
+    "counter".to_string(),
+    || 42,
+    |current_value| *current_value == 0,
+);
 ```
 
-### Compilation error
+### Compilation warning
 
 ```
-error[E0277]: the trait bound `String: Borrow<&str>` is not satisfied
+warning: use of deprecated method `moka::sync::Cache::<K, V, S>::get_with_if`: Replaced with `entry().or_insert_with_if()`
 ```
 
 ### Working fix
 
 ```rust
-if let Some(value) = cache.get("key1") {
-    println!("Found: {}", value);
-}
-assert!(cache.contains_key("key1"));
-cache.invalidate("key1");
-```
-
-The same fix applies to `remove`, `contains_key`, and all other methods taking `&Q where Q: Equivalent<K>`.
-
----
-
-## Issue 3: `cache.entry_by_ref(&"key2")` fails
-
-**Location:** SKILL.md, "The Entry API" section.
-
-**Root Cause:** Same as Issue 2 -- `entry_by_ref` requires `Q: Equivalent<K> + ToOwned<Owned = K> + Hash + ?Sized`. Passing `&"key2"` gives `&&str`, which does not satisfy `ToOwned<Owned = String>`.
-
-### Broken code (from skill)
-
-```rust
-let entry = cache.entry_by_ref(&"key2").or_insert(30);
-let entry = cache.entry_by_ref(&"key3").or_insert_with(|| expensive_compute());
-let entry = cache.entry_by_ref(&"key4").or_default();
-```
-
-### Compilation error
-
-```
-error[E0271]: type mismatch resolving `<&str as ToOwned>::Owned == String`
-error[E0277]: the trait bound `String: Borrow<&str>` is not satisfied
-```
-
-### Working fix
-
-```rust
-let entry = cache.entry_by_ref("key2").or_insert(30);
-let entry = cache.entry_by_ref("key3").or_insert_with(|| expensive_compute());
-let entry = cache.entry_by_ref("key4").or_default();
+let entry = cache
+    .entry("counter".to_string())
+    .or_insert_with_if(|| 42, |current_value| *current_value == 0);
+assert_eq!(*entry.value(), 42);
 ```
 
 ---
 
-## Issue 4: `cache.invalidate_all().await` on async cache returns `()`, not a Future
+## Issue 3: Append-to-cached-value patterns silently drop mutations
 
-**Location:** SKILL.md, "Basic Cache Operations (Async)".
+**Location:** SKILL.md, "Append-to-Cached-Value with `get_with`" and "Try-Append with `try_get_with`" sections.
 
-**Root Cause:** `invalidate_all` on the async (`moka::future::Cache`) cache returns `()` synchronously, not a `Future`. The `.await` in the skill causes a compile error.
+**Root Cause:** `get_with` and `try_get_with` return a **clone** of the cached value. Calling `.push()` on that clone mutates the temporary copy, not the value stored in the cache. The skill's example code silently fails to persist the appended data.
 
 ### Broken code (from skill)
 
 ```rust
-cache.invalidate_all().await;
+cache.get_with(key.clone(), Vec::new).push(format!("entry from thread {}", i));
+```
+
+### Runtime behavior
+
+`cache.get(key).unwrap().len()` is `0` because the `push` was applied to a temporary clone.
+
+### Working fix
+
+Use `Arc<Mutex<T>>` for shared mutable state, or re-insert after mutation:
+
+```rust
+use moka::sync::Cache;
+use std::sync::{Arc, Mutex};
+
+let cache: Cache<String, Arc<Mutex<Vec<String>>>> = Cache::new(100);
+let vec = cache.get_with(key.clone(), || Arc::new(Mutex::new(Vec::new())));
+vec.lock().unwrap().push(format!("entry from thread {}", i));
+```
+
+Or re-insert:
+
+```rust
+let mut entries = cache.try_get_with("log:1".to_string(), || {
+    let mut v = Vec::new();
+    v.push("initialized".to_string());
+    Ok::<_, std::io::Error>(v)
+})?;
+entries.push("appended".to_string());
+cache.insert("log:1".to_string(), entries); // re-insert to persist the mutation
+```
+
+---
+
+## Issue 4: `RemovalCause` does not implement `Display`
+
+**Location:** SKILL.md, "Eviction Listeners" sync example.
+
+**Root Cause:** `RemovalCause` only implements `Debug`, not `Display`. Using `{}` format specifier in `println!` fails.
+
+### Broken code (from skill)
+
+```rust
+println!("Removed key {}: {:?} — {}", key, value, cause);
 ```
 
 ### Compilation error
 
 ```
-error[E0277]: `()` is not a future
-cache.invalidate_all().await;
+error[E0277]: `RemovalCause` doesn't implement `std::fmt::Display`
 ```
 
 ### Working fix
 
+Use `{:?}` instead of `{}`:
+
 ```rust
-cache.invalidate_all(); // no .await needed
+println!("Removed key {}: {:?} — {:?}", key, value, cause);
 ```
 
 ---
@@ -260,48 +270,68 @@ let cache: Cache<String, String> = Cache::builder()
 
 ---
 
-## Issue 6: `build::<String, String>()` with explicit generic arguments
+## Issue 6: `policy.name()` does not exist on `Policy`
 
-**Location:** SKILL.md appears in multiple examples (Eviction Policies, Size-Aware Eviction, TTL, TTI, etc.).
+**Location:** SKILL.md, "Policy Access" section.
 
-**Root Cause:** `Cache::builder().build()` and `SegmentedCache::builder().build()` take **zero** generic arguments. The type is inferred from the context or by binding the result to an annotated variable. Adding turbofish generics causes a compile error.
+**Root Cause:** The `Policy` struct does not have a `name()` method. The cache name is accessible via `cache.name() -> Option<&str>` on the `Cache` struct itself.
+
+### Broken code (from skill)
+
+```rust
+let policy = cache.policy();
+assert_eq!(policy.name(), Some("my-cache"));
+```
+
+### Compilation error
+
+```
+error[E0599]: no method named `name` found for struct `Policy` in the current scope
+```
+
+### Working fix
+
+```rust
+let policy = cache.policy();
+assert_eq!(cache.name(), Some("my-cache"));
+```
+
+---
+
+## Issue 7: `build_with_hasher` requires type annotation with the hasher type
+
+**Location:** SKILL.md, "Custom Hasher" section.
+
+**Root Cause:** `build_with_hasher` returns `Cache<K, V, S>` where `S` is the hasher type. If the cache variable is annotated as `Cache<String, String>` (which defaults the hasher to `RandomState`), passing an `ahash::RandomState` causes a type mismatch.
 
 ### Broken code (from skill)
 
 ```rust
 let cache = Cache::builder()
     .max_capacity(10_000)
-    .eviction_policy(EvictionPolicy::tiny_lfu())
-    .build(); // sometimes written as .build::<String, String>();
+    .build_with_hasher(ahash::RandomState::default());
 ```
-
-Wait -- `.build()` with no generics actually compiles when type inference can determine the types. The problem arises when the skill writes `.build::<String, String>()`. However, if the result is assigned to a variable with no type annotation and no other context, inference can fail. The robust fix is to either:
-
-1. Annotate the variable: `let cache: Cache<String, String> = Cache::builder()...`
-2. Or use no annotation if inference works.
-
-**But note:** In the skill, `build::<String, String>()` IS written with turbofish in several places, causing:
 
 ### Compilation error
 
 ```
-error[E0107]: method takes 0 generic arguments but 2 generic arguments were supplied
+error[E0308]: mismatched types
+expected `std::hash::RandomState`, found `ahash::RandomState`
 ```
 
 ### Working fix
 
-Remove the turbofish or assign to a typed variable:
+Include the hasher type in the cache type:
 
 ```rust
-let cache: Cache<String, String> = Cache::builder()
+let cache: Cache<String, String, ahash::RandomState> = Cache::builder()
     .max_capacity(10_000)
-    .eviction_policy(EvictionPolicy::tiny_lfu())
-    .build();
+    .build_with_hasher(ahash::RandomState::default());
 ```
 
 ---
 
-## Issue 7: `cache.remove_predicates(&[predicate_id])` does not exist in public API
+## Issue 8: `cache.remove_predicates(&[predicate_id])` does not exist in public API
 
 **Location:** SKILL.md, "Predicate-Based Invalidation" section.
 
@@ -336,104 +366,7 @@ let _predicate_id = cache
 
 ---
 
-## Issue 8: `RemovalCause` does not implement `Display`
-
-**Location:** SKILL.md, "Eviction Listeners" sync example.
-
-**Root Cause:** `RemovalCause` only implements `Debug`, not `Display`. Using `{}` format specifier in `println!` fails.
-
-### Broken code (from skill)
-
-```rust
-println!("Removed key {}: {:?} — {}", key, value, cause);
-```
-
-### Compilation error
-
-```
-error[E0277]: `RemovalCause` doesn't implement `std::fmt::Display`
-```
-
-### Working fix
-
-Use `{:?}` instead of `{}`:
-
-```rust
-println!("Removed key {}: {:?} — {:?}", key, value, cause);
-```
-
----
-
-## Issue 9: `policy.name()` does not exist on `Policy`
-
-**Location:** SKILL.md, "Policy Access" section.
-
-**Root Cause:** The `Policy` struct does not have a `name()` method. The cache name is accessible via `cache.name() -> Option<&str>` on the `Cache` struct itself.
-
-### Broken code (from skill)
-
-```rust
-let policy = cache.policy();
-assert_eq!(policy.name(), Some("my-cache"));
-```
-
-### Compilation error
-
-```
-error[E0599]: no method named `name` found for struct `Policy` in the current scope
-```
-
-### Working fix
-
-```rust
-let policy = cache.policy();
-assert_eq!(cache.name(), Some("my-cache"));
-```
-
----
-
-## Issue 10: Custom hasher type annotation
-
-**Location:** SKILL.md, "Custom Hasher" section.
-
-**Root Cause:** `build_with_hasher` returns `Cache<K, V, S>` where `S` is the hasher type. If the cache variable is annotated as `Cache<String, String>` (which defaults the hasher to `RandomState`), passing an `ahash::RandomState` causes a type mismatch.
-
-### Broken code (from skill)
-
-```rust
-let cache = Cache::builder()
-    .max_capacity(10_000)
-    .build_with_hasher(ahash::RandomState::default());
-```
-
-### Compilation error
-
-```
-error[E0308]: mismatched types
-expected `std::hash::RandomState`, found `ahash::RandomState`
-```
-
-### Working fix
-
-Include the hasher type in the cache type:
-
-```rust
-let cache: Cache<String, String, ahash::RandomState> = Cache::builder()
-    .max_capacity(10_000)
-    .build_with_hasher(ahash::RandomState::default());
-```
-
-Or let Rust infer it (if the variable is not otherwise constrained):
-
-```rust
-let _cache = Cache::builder()
-    .max_capacity(10_000)
-    .build_with_hasher(ahash::RandomState::default());
-```
-
----
-
-## Issue 11: Missing `#[derive(Clone)]` on value type for custom expiry
+## Issue 9: Missing `#[derive(Clone)]` on value type for custom expiry
 
 **Location:** SKILL.md, "Per-Entry Custom Expiration via the `Expiry` Trait".
 
@@ -461,3 +394,26 @@ struct ApiKeyData {
     ttl: Duration,
 }
 ```
+
+---
+
+## Issue 10: `invalidate` / `remove` comment about borrowed keys is misleading
+
+**Location:** SKILL.md, "Invalidation" → "Single Entry Invalidation".
+
+**Root Cause:** The skill shows `cache.invalidate(&key);` and `cache.remove(&key);` with the comment "Remove by key reference (borrowed)". This compiles when `key` is an owned `String`, but the comment is misleading because `&String` is not the typical "borrowed key" pattern moka users expect (which is `&str`). The standard borrowed-key lookup is `cache.invalidate("key")` where `"key"` is `&str`.
+
+### Working fix
+
+Use `&str` for borrowed-key lookups, which is moka's idiomatic pattern:
+
+```rust
+cache.invalidate("key");         // &str -> String via Equivalent
+cache.remove("key");           // &str -> String via Equivalent, returns Option<V>
+```
+
+---
+
+## Verification Summary
+
+All other snippets in SKILL.md compile successfully against moka 0.12.15. Verified April 2026 by building a full test harness in `moka-test/` covering every code block in the skill.
